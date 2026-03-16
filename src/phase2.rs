@@ -130,6 +130,7 @@ pub fn build_phase2(data: &[u8], progress_fn: Option<Box<dyn Fn(usize, usize) + 
         call_tree,
         mem_accesses: mem_idx,
         reg_checkpoints: reg_ckpts,
+        string_index: Default::default(),
     }
 }
 

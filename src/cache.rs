@@ -5,7 +5,7 @@ use sha2::{Sha256, Digest};
 use crate::state::Phase2State;
 use crate::taint::scanner::ScanState;
 
-const MAGIC: &[u8; 8] = b"TCACHE01";
+const MAGIC: &[u8; 8] = b"TCACHE02";
 const HEAD_SIZE: usize = 1024 * 1024; // 1MB
 
 static CACHE_DIR_OVERRIDE: RwLock<Option<PathBuf>> = RwLock::new(None);

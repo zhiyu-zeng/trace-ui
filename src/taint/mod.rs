@@ -19,6 +19,7 @@ use call_tree::CallTreeBuilder;
 use insn_class::InsnClass;
 use mem_access::{MemAccessIndex, MemAccessRecord, MemRw};
 use reg_checkpoint::RegCheckpoints;
+use crate::taint::strings::StringBuilder;
 use scanner::{
     mem_access_width, push_unique, PairSplitDeps, RegLastDef, ScanState, PAIR_HALF2_BIT,
     PAIR_SHARED_BIT,
@@ -61,6 +62,7 @@ pub fn scan_unified(
     // ── Phase2 初始化（来自 phase2.rs） ──
     let mut ct_builder = CallTreeBuilder::new();
     let mut mem_idx = MemAccessIndex::new();
+    let mut string_builder = StringBuilder::new();
     let mut reg_ckpts = RegCheckpoints::new(CHECKPOINT_INTERVAL);
     let mut reg_values = [u64::MAX; RegId::COUNT];
 
@@ -397,6 +399,13 @@ pub fn scan_unified(
                     size: mem_op.elem_width,
                 },
             );
+
+            // ── Phase2: 字符串提取 ──
+            if mem_op.is_write && mem_op.elem_width <= 8 {
+                if let Some(value) = mem_op.value {
+                    string_builder.process_write(mem_op.abs, value, mem_op.elem_width, i);
+                }
+            }
         }
 
         // ── Phase2: RegCheckpoints 逻辑 ──
@@ -423,10 +432,13 @@ pub fn scan_unified(
 
     // ── 结束 ──
     let call_tree = ct_builder.finish(state.line_count);
+    let mut string_index = string_builder.finish();
+    StringBuilder::fill_xref_counts(&mut string_index, &mem_idx);
     let phase2_state = Phase2State {
         call_tree,
         mem_accesses: mem_idx,
         reg_checkpoints: reg_ckpts,
+        string_index,
     };
     let line_index = li_builder.finish();
 

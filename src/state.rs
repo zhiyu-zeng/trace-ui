@@ -6,6 +6,7 @@ use crate::taint::call_tree::CallTree;
 use crate::taint::mem_access::MemAccessIndex;
 use crate::taint::reg_checkpoint::RegCheckpoints;
 use crate::line_index::LineIndex;
+use crate::taint::strings::StringIndex;
 
 /// Phase 2 索引数据（CallTree + MemAccessIndex + RegCheckpoints）
 #[derive(Serialize, Deserialize)]
@@ -13,6 +14,7 @@ pub struct Phase2State {
     pub call_tree: CallTree,
     pub mem_accesses: MemAccessIndex,
     pub reg_checkpoints: RegCheckpoints,
+    pub string_index: StringIndex,
 }
 
 /// 单个 trace 文件的会话状态
