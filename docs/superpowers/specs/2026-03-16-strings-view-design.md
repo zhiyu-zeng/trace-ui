@@ -22,12 +22,12 @@
 ```rust
 #[derive(Serialize, Deserialize, Clone)]
 pub struct StringRecord {
-    pub id: u32,
+    // id 使用 Vec<StringRecord> 的数组下标，不单独存储
     pub addr: u64,              // 起始内存地址
     pub content: String,        // 字符串内容
     pub encoding: StringEncoding,  // Ascii | Utf8
     pub byte_len: u32,          // 字节长度
-    pub seq: u32,               // 该版本完成时刻（构成字节中最大的 write seq）
+    pub seq: u32,               // 触发检测到该字符串的 WRITE 操作的 seq
     pub xref_count: u32,        // READ 引用次数（概览用）
 }
 
@@ -47,11 +47,21 @@ pub struct StringIndex {
 
 ```rust
 struct StringBuilder {
-    byte_image: FxHashMap<u64, u8>,        // 当前字节级内存镜像
-    byte_owner: FxHashMap<u64, u32>,       // byte_addr → 活跃字符串 id
+    byte_image: PagedMemory,               // 页式字节级内存镜像（~12MB for 12M bytes）
+    byte_owner: FxHashMap<u64, u32>,       // byte_addr → 活跃字符串 id（仅覆盖活跃字符串字节）
     active: FxHashMap<u32, ActiveString>,   // 活跃字符串集合
     results: Vec<StringRecord>,
     next_id: u32,
+}
+
+/// 页式内存镜像——按 4KB 页存储，避免 per-byte HashMap 开销
+struct PagedMemory {
+    pages: FxHashMap<u64, Box<Page>>,      // page_addr (4K 对齐) → 页
+}
+
+struct Page {
+    data: [u8; 4096],
+    valid: [bool; 4096],                   // 该字节是否被写入过
 }
 
 struct ActiveString {
@@ -64,22 +74,26 @@ struct ActiveString {
 
 ### 提取算法（Phase2 集成）
 
-在 phase2 主扫描循环中，每条 WRITE 指令（`size <= 8`）执行后：
+在 phase2 主扫描循环中，每条 WRITE 指令执行后：
+
+**跳过条件**：`elem_width > 8`（SIMD 128-bit）或 `value` 为 `None`（STP/LDP pair 操作、解析失败）。这些记录的 data 字段不可靠，不应更新 byte_image。注意：在 Phase2 中 `data = mem_op.value.unwrap_or(0)`，因此需要在调用 StringBuilder 前检查原始 `mem_op.value` 是否为 `Some`。
+
+**处理步骤**：
 
 1. **更新 byte_image**：将 `data: u64` 按小端序展开为字节，写入 `byte_image[addr..addr+size]`
-2. **局部扫描**：从写入地址向两端扫描 byte_image 中连续的可打印字符区域
-3. **对比活跃字符串**（通过 byte_owner）：
+2. **局部扫描**：从写入地址向两端扫描 byte_image 中连续的可打印字符区域。**扫描上限 1024 字节**——避免密集可打印区域（如大缓冲区）导致性能退化
+3. **对比活跃字符串**（通过 byte_owner 查找受影响的字符串，同时扫描 byte_image 中的相邻字节发现新字符串）：
    - 活跃字符串消失（被不可打印字节切断）→ 将旧版本存入 `results`，从 `active` 和 `byte_owner` 移除
    - 活跃字符串内容变化 → 存旧版本到 `results`，更新 `active` 中的记录
    - 新字符串形成（连续可打印 ≥ 2 字节）→ 加入 `active`，更新 `byte_owner`
 4. **Phase2 结束时**：将所有仍活跃的字符串存入 `results`
-5. **统计 xref_count**：对每个 StringRecord，回查 MemAccessIndex 该地址范围的 READ 记录数
+5. **统计 xref_count**：对每个 StringRecord，逐地址查询 MemAccessIndex（`mem_idx.get(addr)` 遍历 `[addr, addr+byte_len)` 范围），统计 READ 记录数
 
-跳过 `size > 8` 的记录（SIMD/Pair 操作，value 不可靠）。
+**`seq` 字段语义**：记录触发检测到该字符串的 WRITE 操作的 seq。对于逐字节写入的字符串，这是写入最后一个使其达到 min_len 的字节的 seq。这比"所有构成字节中最大的 write seq"更简单，且不需要额外的 byte_seq map。
 
 ### UTF-8 检测策略
 
-1. 扫描时用宽松定义：`0x09(tab)、0x0A(LF)、0x20-0x7E、0x80-0xF4`
+1. 扫描时用宽松定义：`0x20-0x7E、0x80-0xF4`（不含 `\t`/`\n`/`\r`，避免跨行拼接假字符串）
 2. 提取连续区域后，用 `str::from_utf8()` 严格验证
 3. 验证通过且含多字节序列 → 标记 `Utf8`；纯 ASCII → 标记 `Ascii`
 4. UTF-8 验证失败 → 降级为纯 ASCII 模式（只保留 0x20-0x7E 部分）
@@ -125,6 +139,27 @@ pub struct StringXRef {
 - `StringIndex` 作为 `Phase2State` 的新字段，随 bincode 缓存一起序列化
 - 缓存中存 min_len=2 的全量结果，查询时按用户阈值过滤返回
 - 二次打开同一文件时从缓存加载，无需重新提取
+- **缓存兼容性**：`Phase2State` 结构变化会导致旧缓存反序列化失败。需将 `cache.rs` 中的 `MAGIC` 从 `TCACHE01` 升级为 `TCACHE02`。旧缓存 `validate_header` 失败时返回 `None`，触发自动重建
+
+### 内存开销评估
+
+`byte_image` 和 `byte_owner` 的 FxHashMap 每个 entry 约 25-32 字节。对于 10M 行 trace（假设 ~3M 条 WRITE，每次平均 4 字节 = ~12M 字节地址）：
+
+- `byte_image`: ~12M × 25 bytes ≈ 300MB
+- `byte_owner`: 仅覆盖活跃字符串的字节，通常远小于 byte_image（几十 KB ~ 几 MB）
+
+**优化方案**：byte_image 改用页式结构 `FxHashMap<u64, Box<[u8; 4096]>>`（按 4KB 页存储），将 per-byte 开销降至 ~1 byte/entry + per-page 开销。对于 12M 字节地址，约 3000 个页 × 4KB ≈ 12MB + 少量 HashMap 开销。这是显著的改进。
+
+```rust
+struct PagedMemory {
+    pages: FxHashMap<u64, Box<Page>>,  // page_addr (4K 对齐) → 4KB 页
+}
+
+struct Page {
+    data: [u8; 4096],
+    valid: [bool; 4096],  // 该字节是否被写入过
+}
+```
 
 ## 前端设计
 
@@ -157,7 +192,7 @@ pub struct StringXRef {
 - **分页加载**：初始加载 500 条，滚动到底部时加载更多（infinite scroll）
 - **搜索**：debounce 300ms，调用 `get_strings` 传 search 参数，后端子串匹配
 - **min_len 滑块**：range input，范围 2-20，默认 4，变更时 debounce 200ms 重新查询
-- **多版本折叠**：同 addr 的记录分组，显示最新版本，左侧 ▶ 指示器可展开查看历史
+- **多版本折叠**：后端 `get_strings` 返回扁平列表（按 seq 排序），前端按 addr 分组做纯 UI 层折叠，显示最新版本，左侧 ▶ 指示器可展开查看历史。注意：分页加载时同一 addr 的记录可能跨页，前端在加载新页时需合并已有分组
 
 ### 交互联动
 
@@ -218,7 +253,8 @@ pub struct StringXRef {
 | 文件 | 变更 |
 |------|------|
 | `src/taint/strings.rs` | **新增** — StringRecord、StringIndex、StringBuilder、提取算法 |
-| `src/taint/mem_access.rs` | 暴露迭代器（`pub fn iter()`），用于 xref_count 统计 |
+| `src/taint/mem_access.rs` | 无需新增迭代器，xref 查询使用现有的 `get(addr)` 逐地址查询 |
+| `src/cache.rs` | MAGIC 版本号从 `TCACHE01` 升级为 `TCACHE02` |
 | `src/taint/mod.rs` | 添加 `pub mod strings;` |
 | `src/phase2.rs` | 集成 StringBuilder 到主扫描循环，StringIndex 加入 Phase2State |
 | `src/commands/strings.rs` | **新增** — `get_strings`、`get_string_xrefs` 命令 |
