@@ -3,6 +3,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use tauri::{AppHandle, State};
 use crate::state::{AppState, SessionState};
+use crate::taint::types::TraceFormat;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -46,6 +47,9 @@ pub async fn create_session(
             scan_state: None,
             slice_result: None,
             scan_strings_cancelled: Arc::new(AtomicBool::new(false)),
+            trace_format: TraceFormat::Unidbg,
+            call_annotations: std::collections::HashMap::new(),
+            consumed_seqs: Vec::new(),
         });
     }
 

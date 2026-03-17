@@ -8,6 +8,8 @@ use crate::taint::mem_access::MemAccessIndex;
 use crate::taint::reg_checkpoint::RegCheckpoints;
 use crate::line_index::LineIndex;
 use crate::taint::strings::StringIndex;
+use crate::taint::types::TraceFormat;
+use crate::taint::gumtrace_parser::CallAnnotation;
 
 /// Phase 2 索引数据（CallTree + MemAccessIndex + RegCheckpoints）
 #[derive(Serialize, Deserialize)]
@@ -30,6 +32,9 @@ pub struct SessionState {
     pub scan_state: Option<crate::taint::scanner::ScanState>,
     pub slice_result: Option<bitvec::prelude::BitVec>,
     pub scan_strings_cancelled: Arc<AtomicBool>,
+    pub trace_format: TraceFormat,
+    pub call_annotations: std::collections::HashMap<u32, CallAnnotation>,
+    pub consumed_seqs: Vec<u32>,
 }
 
 /// 全局应用状态，支持多 Session（key = session_id）

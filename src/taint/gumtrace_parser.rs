@@ -6,6 +6,80 @@ use super::parser::{
     parse_hex_u64, parse_operands_into,
 };
 use super::types::*;
+use super::types::TraceFormat;
+
+/// 外部函数调用的注释信息（关联到 bl/blr 指令行）
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CallAnnotation {
+    pub func_name: String,
+    pub is_jni: bool,
+    pub args: Vec<(String, String)>,  // (index, decoded_value)
+    pub ret_value: Option<String>,
+    pub raw_lines: Vec<String>,       // 所有原始特殊行（用于 tooltip）
+}
+
+impl CallAnnotation {
+    /// 生成紧凑摘要，如: strlen("HttpRequestCallback") → 0x13
+    pub fn summary(&self) -> String {
+        let decoded_args: Vec<String> = self.args.iter()
+            .map(|(_, v)| {
+                if v.starts_with("0x") || v.starts_with("0X") {
+                    v.clone()
+                } else {
+                    format!("\"{}\"", v)
+                }
+            })
+            .collect();
+        let args_str = if decoded_args.is_empty() {
+            String::new()
+        } else {
+            format!("({})", decoded_args.join(", "))
+        };
+
+        let ret_str = self.ret_value.as_deref().unwrap_or("");
+
+        if ret_str.is_empty() {
+            format!("{}{}", self.func_name, args_str)
+        } else {
+            format!("{}{} → {}", self.func_name, args_str, ret_str)
+        }
+    }
+
+    /// 生成完整 tooltip 文本
+    pub fn tooltip(&self) -> String {
+        self.raw_lines.join("\n")
+    }
+}
+
+/// 从文件的前几行自动检测 trace 格式
+pub fn detect_format(data: &[u8]) -> TraceFormat {
+    let mut pos = 0;
+    let mut checked = 0;
+    while pos < data.len() && checked < 20 {
+        let end = memchr::memchr(b'\n', &data[pos..])
+            .map(|i| pos + i)
+            .unwrap_or(data.len());
+        let line = &data[pos..end];
+
+        if !line.is_empty() {
+            // unidbg: starts with [HH:MM:SS (timestamp)
+            if line.len() > 10 && line[0] == b'['
+                && line[1].is_ascii_digit() && line[2].is_ascii_digit()
+                && line[3] == b':'
+            {
+                return TraceFormat::Unidbg;
+            }
+            // gumtrace: starts with [module], has ! (address separator)
+            if line[0] == b'[' && memchr::memchr(b'!', line).is_some() {
+                return TraceFormat::Gumtrace;
+            }
+        }
+
+        pos = end + 1;
+        checked += 1;
+    }
+    TraceFormat::Unidbg // default
+}
 
 /// Returns true if line doesn't start with `[` (i.e., not an instruction line).
 pub fn is_special_line(raw: &str) -> bool {
@@ -271,6 +345,54 @@ fn find_gumtrace_mem_op(
 mod tests {
     use super::*;
     use crate::taint::types::*;
+
+    #[test]
+    fn test_detect_format_unidbg() {
+        let data = br#"[07:17:13 488][libtiny.so 0x174250] [fd7bbaa9] 0x40174250: "stp x29, x30, [sp, #-0x60]!""#;
+        assert_eq!(detect_format(data), TraceFormat::Unidbg);
+    }
+
+    #[test]
+    fn test_detect_format_gumtrace() {
+        let data = b"[libmetasec_ov.so] 0x7522e85ce0!0x82ce0 sub x0, x29, #0x80; x0=0x75150f2e20\n";
+        assert_eq!(detect_format(data), TraceFormat::Gumtrace);
+    }
+
+    #[test]
+    fn test_call_annotation_summary() {
+        let ann = CallAnnotation {
+            func_name: "strlen".to_string(),
+            is_jni: false,
+            args: vec![("0".to_string(), "HttpRequestCallback".to_string())],
+            ret_value: Some("0x13".to_string()),
+            raw_lines: vec![],
+        };
+        assert_eq!(ann.summary(), "strlen(\"HttpRequestCallback\") → 0x13");
+    }
+
+    #[test]
+    fn test_call_annotation_summary_hex_args() {
+        let ann = CallAnnotation {
+            func_name: "malloc".to_string(),
+            is_jni: false,
+            args: vec![("0".to_string(), "0x14".to_string())],
+            ret_value: Some("0x7724646770".to_string()),
+            raw_lines: vec![],
+        };
+        assert_eq!(ann.summary(), "malloc(0x14) → 0x7724646770");
+    }
+
+    #[test]
+    fn test_call_annotation_summary_no_args() {
+        let ann = CallAnnotation {
+            func_name: "getpid".to_string(),
+            is_jni: false,
+            args: vec![],
+            ret_value: Some("0x1234".to_string()),
+            raw_lines: vec![],
+        };
+        assert_eq!(ann.summary(), "getpid → 0x1234");
+    }
 
     #[test]
     fn test_parse_gumtrace_basic_insn() {
