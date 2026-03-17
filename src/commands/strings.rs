@@ -131,3 +131,80 @@ pub fn get_string_xrefs(
     xrefs.sort_by_key(|x| x.seq);
     Ok(xrefs)
 }
+
+#[tauri::command]
+pub async fn scan_strings(
+    session_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    // 1. Collect Write records and get cancellation flag
+    let (mut writes, cancelled) = {
+        let sessions = state.sessions.read().map_err(|e| e.to_string())?;
+        let session = sessions.get(&session_id)
+            .ok_or_else(|| format!("Session {} 不存在", session_id))?;
+        let phase2 = session.phase2.as_ref().ok_or("索引尚未构建完成")?;
+
+        let mut writes: Vec<(u64, u64, u8, u32)> = Vec::new();
+        for (addr, rec) in phase2.mem_accesses.iter_all() {
+            if rec.rw == MemRw::Write && rec.size <= 8 {
+                writes.push((addr, rec.data, rec.size, rec.seq));
+            }
+        }
+        (writes, session.scan_strings_cancelled.clone())
+    };
+
+    // 2. Sort by seq
+    writes.sort_unstable_by_key(|w| w.3);
+
+    // 3. Reset cancellation flag
+    cancelled.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    // 4. Run StringBuilder in blocking thread
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let mut sb = crate::taint::strings::StringBuilder::new();
+        for (i, &(addr, data, size, seq)) in writes.iter().enumerate() {
+            if i % 10000 == 0 && cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("cancelled".to_string());
+            }
+            sb.process_write(addr, data, size, seq);
+        }
+        Ok(sb)
+    })
+    .await
+    .map_err(|e| format!("扫描线程 panic: {}", e))??;
+
+    // 5. finish + fill_xref_counts
+    let mut string_index = result.finish();
+    {
+        let sessions = state.sessions.read().map_err(|e| e.to_string())?;
+        let session = sessions.get(&session_id)
+            .ok_or_else(|| format!("Session {} 不存在", session_id))?;
+        let phase2 = session.phase2.as_ref().ok_or("索引尚未构建完成")?;
+        crate::taint::strings::StringBuilder::fill_xref_counts(&mut string_index, &phase2.mem_accesses);
+    }
+
+    // 6. Write results and update cache
+    {
+        let mut sessions = state.sessions.write().map_err(|e| e.to_string())?;
+        let session = sessions.get_mut(&session_id)
+            .ok_or_else(|| format!("Session {} 不存在", session_id))?;
+        if let Some(ref mut phase2) = session.phase2 {
+            phase2.string_index = string_index;
+            crate::cache::save_cache(&session.file_path, &*session.mmap, phase2);
+        }
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn cancel_scan_strings(
+    session_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let sessions = state.sessions.read().map_err(|e| e.to_string())?;
+    if let Some(session) = sessions.get(&session_id) {
+        session.scan_strings_cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    Ok(())
+}
