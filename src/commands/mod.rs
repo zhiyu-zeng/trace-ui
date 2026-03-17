@@ -3,6 +3,7 @@ pub mod cache;
 pub mod call_tree;
 pub mod def_use;
 pub mod file;
+pub mod functions;
 pub mod index;
 pub mod memory;
 pub mod registers;

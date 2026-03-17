@@ -101,3 +101,19 @@ export interface StringXRef {
   insn_addr: string;
   disasm: string;
 }
+
+export interface FunctionCallOccurrence {
+  seq: number;
+  summary: string;
+}
+
+export interface FunctionCallEntry {
+  func_name: string;
+  is_jni: boolean;
+  occurrences: FunctionCallOccurrence[];
+}
+
+export interface FunctionCallsResult {
+  functions: FunctionCallEntry[];
+  total_calls: number;
+}
