@@ -93,6 +93,7 @@ function App() {
   const [selectedRegInfo, setSelectedRegInfo] = useState<{ seq: number; regName: string } | null>(null);
 
   const [showGoto, setShowGoto] = useState(false);
+  const [stringsScanningSessionId, setStringsScanningSessionId] = useState<string | null>(null);
 
   const { recentFiles, addRecent, removeRecent, clearRecent } = useRecentFiles();
   const { highlights, loadForFile, setHighlight, toggleStrikethrough, resetHighlight, toggleHidden, unhideGroup, setComment, deleteComment } = useHighlights();
@@ -497,6 +498,37 @@ function App() {
     }
   }, [searchTrace, floatedPanels]);
 
+  const scanStrings = useCallback(async () => {
+    if (!activeSessionId) return;
+    setStringsScanningSessionId(activeSessionId);
+    try {
+      await invoke("scan_strings", { sessionId: activeSessionId });
+      setHasStringIndexMap(prev => new Map(prev).set(activeSessionId, true));
+    } catch (e) {
+      console.warn("scan_strings:", e);
+    } finally {
+      setStringsScanningSessionId(null);
+    }
+  }, [activeSessionId, setHasStringIndexMap]);
+
+  const cancelScanStrings = useCallback(async () => {
+    if (!stringsScanningSessionId) return;
+    await invoke("cancel_scan_strings", { sessionId: stringsScanningSessionId });
+  }, [stringsScanningSessionId]);
+
+  useEffect(() => {
+    if (!stringsScanningSessionId) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        const hasOpenDialog = document.querySelector('[style*="position: fixed"][style*="z-index"]');
+        if (hasOpenDialog) return;
+        cancelScanStrings();
+      }
+    };
+    document.addEventListener("keydown", handler);
+    return () => document.removeEventListener("keydown", handler);
+  }, [stringsScanningSessionId, cancelScanStrings]);
+
   // 浮动窗口引用（用于主窗口关闭时清理）
   const floatingWindowRefs = useRef<Map<string, WebviewWindow>>(new Map());
 
@@ -875,6 +907,10 @@ function App() {
             }
           }
         }}
+        onScanStrings={scanStrings}
+        hasStringIndex={hasStringIndexMap.get(activeSessionId ?? "") ?? false}
+        stringsScanning={stringsScanningSessionId === activeSessionId}
+        isPhase2Ready={isPhase2Ready}
         onClearCache={clearRecent}
         regSelected={selectedRegInfo !== null}
       />
