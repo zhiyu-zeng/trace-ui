@@ -340,6 +340,7 @@ export default function TraceTable({
 
   // === 注释相关状态 ===
   const [commentTooltip, setCommentTooltip] = useState<{ seq: number; x: number; y: number; text: string } | null>(null);
+  const [callInfoTooltip, setCallInfoTooltip] = useState<{ x: number; y: number; text: string; isJni: boolean } | null>(null);
   const [commentEditor, setCommentEditor] = useState<{ seq: number; x: number; y: number; text: string } | null>(null);
   const commentEditorRef = useRef<HTMLDivElement>(null);
   const textSelectionRef = useRef<string>(""); // 右键菜单打开时保存的文本选区
@@ -1049,13 +1050,35 @@ export default function TraceTable({
       dirtyRef.current = true;
     }
 
-    // 检测寄存器 hitbox
+    // 检测寄存器 hitbox 和 call_info hitbox
     for (const hb of hitboxesRef.current) {
       if (hb.rowIndex === rowIdx && x >= hb.x && x <= hb.x + hb.width) {
+        if (hb.token.startsWith("__call_info__")) {
+          const hbSeq = hb.seq;
+          const hoveredLine = visibleLines.get(hbSeq) ?? prefetchCacheRef.current.get(hbSeq);
+          if (hoveredLine?.call_info) {
+            const ctr = containerRef.current;
+            if (ctr) {
+              const ctrRect = ctr.getBoundingClientRect();
+              const scrollFrac2 = (scrollPosRef.current % 1) * ROW_HEIGHT;
+              setCallInfoTooltip({
+                x: ctrRect.left + hb.x,
+                y: ctrRect.top + hb.rowIndex * ROW_HEIGHT + ROW_HEIGHT - scrollFrac2,
+                text: hoveredLine.call_info.tooltip,
+                isJni: hoveredLine.call_info.is_jni,
+              });
+            }
+          }
+          if (textOverlayRef.current) textOverlayRef.current.style.cursor = "default";
+          return;
+        }
         if (textOverlayRef.current) textOverlayRef.current.style.cursor = "pointer";
+        if (callInfoTooltip) setCallInfoTooltip(null);
         return;
       }
     }
+    // 不在 call_info hitbox 上时清除 tooltip
+    if (callInfoTooltip) setCallInfoTooltip(null);
 
     // 检测折叠按钮区域或摘要行
     if (x >= COL_FOLD && x < COL_MEMRW) {
@@ -1188,7 +1211,7 @@ export default function TraceTable({
     }
 
     if (textOverlayRef.current) textOverlayRef.current.style.cursor = "text";
-  }, [finalVirtualTotalRows, finalResolveVirtualIndex, blLineMap, isFolded, highlights, commentTooltip, commentEditor, visibleLines, canvasSize, effectiveChangesWidth]);
+  }, [finalVirtualTotalRows, finalResolveVirtualIndex, blLineMap, isFolded, highlights, commentTooltip, callInfoTooltip, commentEditor, visibleLines, canvasSize, effectiveChangesWidth]);
 
   // 获取当前选中的 seq 列表（多选或单选）
   const getSelectedSeqs = useCallback((): number[] => {
@@ -1723,6 +1746,26 @@ export default function TraceTable({
           ctx.fillStyle = COLORS.textPrimary;
           ctx.fillText(tail, curX, textY);
           curX += tail.length * charW;
+        }
+
+        // Call info inline rendering (gumtrace external function call summary)
+        if (line.call_info) {
+          const ci = line.call_info;
+          const gap = charW * 2; // 2 char spacing
+          const ciX = curX + gap;
+          ctx.font = FONT_ITALIC;
+          ctx.fillStyle = ci.is_jni ? COLORS.callInfoJni : COLORS.callInfoNormal;
+          const ciText = ci.summary;
+          const maxCiChars = Math.floor((canvasSize.width - ciX - RIGHT_GUTTER) / charW);
+          const displayText = ciText.length > maxCiChars && maxCiChars > 1
+            ? ciText.slice(0, maxCiChars - 1) + "\u2026"
+            : ciText;
+          if (maxCiChars > 0) {
+            ctx.fillText(displayText, ciX, textY);
+            const ciWidth = displayText.length * charW;
+            hitboxes.push({ x: ciX, width: ciWidth, rowIndex: i, token: `__call_info__${seq}`, seq });
+          }
+          ctx.font = FONT; // restore font
         }
       }
 
@@ -2417,6 +2460,34 @@ export default function TraceTable({
             }}
           >
             {commentTooltip.text}
+          </div>,
+          document.body,
+        )}
+        {/* call_info 悬浮提示 — Portal 到 body */}
+        {callInfoTooltip && createPortal(
+          <div
+            style={{
+              position: "fixed",
+              left: callInfoTooltip.x,
+              top: callInfoTooltip.y,
+              background: "var(--bg-dialog, #2b2d30)",
+              border: `1px solid ${callInfoTooltip.isJni ? "#c792ea" : "#56d4dd"}`,
+              borderRadius: 4,
+              boxShadow: "0 2px 8px rgba(0,0,0,0.4)",
+              padding: "8px 12px",
+              maxWidth: 500,
+              maxHeight: 300,
+              overflow: "auto",
+              zIndex: 10000,
+              fontSize: 12,
+              fontFamily: '"JetBrains Mono", "Fira Code", monospace',
+              color: "var(--text-primary, #abb2bf)",
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-word",
+              pointerEvents: "none",
+            }}
+          >
+            {callInfoTooltip.text}
           </div>,
           document.body,
         )}

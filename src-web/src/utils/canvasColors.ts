@@ -35,6 +35,8 @@ export const TRACE_TABLE_COLORS = {
   strikethroughLine: "#888888",
   commentGutter: "rgba(230,160,50,0.8)",
   commentInline: "#8b95a7",
+  callInfoNormal: "#56d4dd",   // cyan: normal external function call
+  callInfoJni: "#c792ea",      // purple: JNI call
 };
 
 // ── Minimap 特有颜色 ──

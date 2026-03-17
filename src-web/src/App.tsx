@@ -424,6 +424,24 @@ function App() {
     }).catch(e => console.error("Failed to restore taint state:", e));
   }, [activeSessionId, isPhase2Ready, filePath]);
 
+  // isPhase2Ready 变为 true 时，获取 consumed_seqs 并自动隐藏这些行
+  const consumedSeqsApplied = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!activeSessionId || !isPhase2Ready) return;
+    if (consumedSeqsApplied.current.has(activeSessionId)) return;
+    consumedSeqsApplied.current.add(activeSessionId);
+    invoke<number[]>("get_consumed_seqs", { sessionId: activeSessionId })
+      .then((consumedSeqs) => {
+        if (consumedSeqs.length > 0) {
+          setHighlight(consumedSeqs, { hidden: true });
+        }
+      })
+      .catch((e) => {
+        // get_consumed_seqs 可能不存在（非 gumtrace 文件），忽略错误
+        console.debug("get_consumed_seqs:", e);
+      });
+  }, [activeSessionId, isPhase2Ready, setHighlight]);
+
   // 窗口关闭前保存会话快照（含污点配置）
   useEffect(() => {
     const handleBeforeUnload = () => {
