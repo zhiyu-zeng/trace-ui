@@ -58,6 +58,7 @@ impl SessionState {
         self.phase2_store.as_ref().map(|s| s.reg_checkpoints_view())
     }
 
+    #[allow(dead_code)]
     pub fn deps_view(&self) -> Option<DepsView<'_>> {
         self.scan_store.as_ref().map(|s| s.deps_view())
     }
@@ -66,10 +67,12 @@ impl SessionState {
         self.scan_store.as_ref().map(|s| s.mem_last_def_view())
     }
 
+    #[allow(dead_code)]
     pub fn pair_split_view(&self) -> Option<PairSplitView<'_>> {
         self.scan_store.as_ref().map(|s| s.pair_split_view())
     }
 
+    #[allow(dead_code)]
     pub fn init_mem_loads_view(&self) -> Option<BitView<'_>> {
         self.scan_store.as_ref().map(|s| s.init_mem_loads_view())
     }
@@ -82,6 +85,7 @@ impl SessionState {
         self.scan_store.as_ref().map(|s| s.scan_view())
     }
 
+    #[allow(dead_code)]
     pub fn scan_line_count(&self) -> u32 {
         self.scan_store.as_ref().map(|s| s.line_count()).unwrap_or(0)
     }

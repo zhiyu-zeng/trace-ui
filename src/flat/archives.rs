@@ -182,7 +182,6 @@ impl CachedStore<ScanArchive> {
         ScanView {
             deps: self.deps_view(),
             pair_split: self.pair_split_view(),
-            init_mem_loads: self.init_mem_loads_view(),
             line_count: self.line_count(),
         }
     }

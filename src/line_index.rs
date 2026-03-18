@@ -119,6 +119,7 @@ impl LineIndex {
 
     /// 返回指定行号的起始字节偏移（通过采样点 + 向前扫描换行符定位）。
     /// 用于并行搜索时的分块定位。
+    #[allow(dead_code)]
     pub fn line_byte_offset(&self, data: &[u8], seq: u32) -> Option<u64> {
         if seq >= self.total {
             return None;
@@ -153,6 +154,7 @@ impl LineIndex {
     }
 
     /// 获取指定行的原始字节切片
+    #[allow(dead_code)]
     pub fn get_line<'a>(&self, data: &'a [u8], seq: u32) -> Option<&'a [u8]> {
         if seq >= self.total {
             return None;

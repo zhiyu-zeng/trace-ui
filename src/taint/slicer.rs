@@ -208,7 +208,7 @@ mod tests {
         let view = ScanView {
             deps: deps.view(),
             pair_split: pair_split.view(),
-            init_mem_loads: init_mem_loads.view(),
+            
             line_count: state.line_count,
         };
         let start = vec![*state.reg_last_def.get(&RegId::X0).unwrap()];
