@@ -7,13 +7,18 @@ use std::collections::HashMap;
 use bitvec::prelude::BitVec;
 use rustc_hash::FxHashMap;
 
+use crate::line_index::LineIndex;
 use crate::taint::call_tree::{CallTree, CallTreeBuilder};
 use crate::taint::gumtrace_parser::CallAnnotation;
+use crate::taint::mem_access::{MemAccessIndex};
 use crate::taint::parallel_types::{
     CallTreeEvent, GumtraceAnnotEvent, PartialUnresolvedLoad, PartialUnresolvedPairLoad,
     SpecialLineData, UnresolvedLoad, UnresolvedPairLoad, UnresolvedRegUse,
 };
+use crate::taint::reg_checkpoint::RegCheckpoints;
 use crate::taint::scanner::{push_unique, CompactDeps, PairSplitDeps, RegLastDef, CONTROL_DEP_BIT};
+use crate::taint::strings::StringIndex;
+use crate::taint::types::RegId;
 
 /// Resolve a fully unresolved load using global state.
 /// Determines pass-through exactly as single-threaded scan would.
@@ -374,10 +379,85 @@ pub fn replay_gumtrace_annotations(
     (call_annotations, extra_consumed)
 }
 
+/// Fix RegCheckpoints by propagating previous chunk's final register values.
+/// For each snapshot, if a register value is u64::MAX (unknown), replace with prev chunk's value.
+pub fn fix_reg_checkpoints(
+    ckpts: &mut RegCheckpoints,
+    prev_final_reg_values: &[u64; RegId::COUNT],
+) {
+    for snapshot in &mut ckpts.snapshots {
+        for r in 0..RegId::COUNT {
+            if snapshot.0[r] == u64::MAX && prev_final_reg_values[r] != u64::MAX {
+                snapshot.0[r] = prev_final_reg_values[r];
+            }
+        }
+    }
+}
+
+/// Merge multiple MemAccessIndex. Records within same address preserve chunk order.
+pub fn merge_mem_access_indices(indices: Vec<MemAccessIndex>) -> MemAccessIndex {
+    let mut merged = MemAccessIndex::new();
+    for idx in indices {
+        for (addr, record) in idx.iter_all() {
+            merged.add(addr, record.clone());
+        }
+    }
+    merged
+}
+
+/// Merge LineIndex from chunks. Each chunk used global byte offsets and
+/// LineIndexBuilder with correct start_line, so sampled_offsets are globally aligned.
+/// Simply concatenate sampled_offsets and sum totals.
+pub fn merge_line_indices(indices: Vec<LineIndex>) -> LineIndex {
+    LineIndex::merge(indices)
+}
+
+/// Merge init_mem_loads BitVecs and apply corrections.
+pub fn merge_init_mem_loads(
+    chunk_inits: Vec<BitVec>,
+    corrections: &[(u32, bool)],
+) -> BitVec {
+    let total_bits: usize = chunk_inits.iter().map(|b| b.len()).sum();
+    let mut merged = BitVec::with_capacity(total_bits);
+    for chunk in chunk_inits {
+        merged.extend_from_bitslice(&chunk);
+    }
+    for &(line, value) in corrections {
+        if (line as usize) < merged.len() {
+            merged.set(line as usize, value);
+        }
+    }
+    merged
+}
+
+/// Merge pair_split HashMaps from chunks + fixup additions.
+pub fn merge_pair_splits(
+    chunk_splits: Vec<FxHashMap<u32, PairSplitDeps>>,
+    fixup_splits: Vec<(u32, PairSplitDeps)>,
+) -> FxHashMap<u32, PairSplitDeps> {
+    let mut merged = FxHashMap::default();
+    for chunk in chunk_splits {
+        merged.extend(chunk);
+    }
+    for (line, split) in fixup_splits {
+        merged.insert(line, split);
+    }
+    merged
+}
+
+/// Merge StringIndex from chunks. Concatenate and sort by seq.
+pub fn merge_string_indices(indices: Vec<StringIndex>) -> StringIndex {
+    let mut all_strings = Vec::new();
+    for idx in indices {
+        all_strings.extend(idx.strings);
+    }
+    all_strings.sort_by_key(|r| r.seq);
+    StringIndex { strings: all_strings }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::taint::types::RegId;
     use smallvec::smallvec;
 
     #[test]
@@ -722,5 +802,100 @@ mod tests {
         let (annotations, extra) = replay_gumtrace_annotations(&events);
         assert_eq!(annotations.len(), 1);
         assert_eq!(extra, vec![7]); // orphan line added to consumed
+    }
+
+    #[test]
+    fn test_fix_reg_checkpoints() {
+        use crate::taint::reg_checkpoint::RegCheckpoints;
+        let mut ckpts = RegCheckpoints::new(1000);
+        let mut vals = [u64::MAX; RegId::COUNT];
+        ckpts.save_checkpoint(&vals);  // first checkpoint: all unknown
+        vals[0] = 0x55;
+        ckpts.save_checkpoint(&vals);  // second: x0 = 0x55, rest unknown
+
+        let mut prev_final = [u64::MAX; RegId::COUNT];
+        prev_final[0] = 0x42;
+        prev_final[1] = 0x99;
+
+        fix_reg_checkpoints(&mut ckpts, &prev_final);
+
+        assert_eq!(ckpts.snapshots[0].0[0], 0x42); // was MAX, now prev value
+        assert_eq!(ckpts.snapshots[0].0[1], 0x99); // was MAX, now prev value
+        assert_eq!(ckpts.snapshots[1].0[0], 0x55); // was set in chunk, kept
+        assert_eq!(ckpts.snapshots[1].0[1], 0x99); // was MAX, now prev value
+    }
+
+    #[test]
+    fn test_merge_init_mem_loads() {
+        use bitvec::prelude::*;
+        let mut b1: BitVec = BitVec::new();
+        b1.push(true); b1.push(false); b1.push(true);
+        let mut b2: BitVec = BitVec::new();
+        b2.push(false); b2.push(true);
+
+        let corrections = vec![(0u32, false), (4, false)]; // clear bits 0 and 4
+
+        let merged = merge_init_mem_loads(vec![b1, b2], &corrections);
+        assert_eq!(merged.len(), 5);
+        assert_eq!(merged[0], false); // corrected from true
+        assert_eq!(merged[1], false); // original
+        assert_eq!(merged[2], true);  // original
+        assert_eq!(merged[3], false); // original
+        assert_eq!(merged[4], false); // corrected from true
+    }
+
+    #[test]
+    fn test_merge_mem_access_indices() {
+        use crate::taint::mem_access::{MemAccessIndex, MemAccessRecord, MemRw};
+        let mut idx1 = MemAccessIndex::new();
+        idx1.add(0x1000, MemAccessRecord { seq: 1, insn_addr: 0x100, rw: MemRw::Read, data: 0, size: 4 });
+        let mut idx2 = MemAccessIndex::new();
+        idx2.add(0x1000, MemAccessRecord { seq: 5, insn_addr: 0x200, rw: MemRw::Write, data: 42, size: 4 });
+        idx2.add(0x2000, MemAccessRecord { seq: 6, insn_addr: 0x204, rw: MemRw::Read, data: 0, size: 1 });
+
+        let merged = merge_mem_access_indices(vec![idx1, idx2]);
+        assert_eq!(merged.total_addresses(), 2);
+        assert_eq!(merged.total_records(), 3);
+        let records_at_1000 = merged.get(0x1000).unwrap();
+        assert_eq!(records_at_1000.len(), 2);
+    }
+
+    #[test]
+    fn test_merge_string_indices() {
+        use crate::taint::strings::{StringIndex, StringRecord, StringEncoding};
+        let idx1 = StringIndex {
+            strings: vec![
+                StringRecord { addr: 0x1000, content: "hello".to_string(), encoding: StringEncoding::Ascii, byte_len: 5, seq: 10, xref_count: 0 },
+                StringRecord { addr: 0x2000, content: "world".to_string(), encoding: StringEncoding::Ascii, byte_len: 5, seq: 30, xref_count: 0 },
+            ],
+        };
+        let idx2 = StringIndex {
+            strings: vec![
+                StringRecord { addr: 0x3000, content: "foo".to_string(), encoding: StringEncoding::Ascii, byte_len: 3, seq: 20, xref_count: 0 },
+            ],
+        };
+
+        let merged = merge_string_indices(vec![idx1, idx2]);
+        assert_eq!(merged.strings.len(), 3);
+        // sorted by seq
+        assert_eq!(merged.strings[0].seq, 10);
+        assert_eq!(merged.strings[1].seq, 20);
+        assert_eq!(merged.strings[2].seq, 30);
+    }
+
+    #[test]
+    fn test_merge_pair_splits() {
+        let mut c1: FxHashMap<u32, PairSplitDeps> = FxHashMap::default();
+        c1.insert(10, PairSplitDeps::default());
+        let mut c2: FxHashMap<u32, PairSplitDeps> = FxHashMap::default();
+        c2.insert(20, PairSplitDeps::default());
+
+        let fixups = vec![(30u32, PairSplitDeps::default())];
+
+        let merged = merge_pair_splits(vec![c1, c2], fixups);
+        assert_eq!(merged.len(), 3);
+        assert!(merged.contains_key(&10));
+        assert!(merged.contains_key(&20));
+        assert!(merged.contains_key(&30));
     }
 }

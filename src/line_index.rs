@@ -112,6 +112,22 @@ impl LineIndex {
         self.total
     }
 
+    /// Merge multiple LineIndex instances (for parallel scanning).
+    /// Each chunk used global byte offsets and LineIndexBuilder with correct start_line,
+    /// so sampled_offsets are globally aligned. Simply concatenate and sum totals.
+    pub(crate) fn merge(indices: Vec<LineIndex>) -> LineIndex {
+        let mut all_offsets = Vec::new();
+        let mut total = 0u32;
+        for idx in indices {
+            all_offsets.extend(idx.sampled_offsets);
+            total += idx.total;
+        }
+        LineIndex {
+            sampled_offsets: all_offsets,
+            total,
+        }
+    }
+
     /// 获取指定行的原始字节切片
     pub fn get_line<'a>(&self, data: &'a [u8], seq: u32) -> Option<&'a [u8]> {
         if seq >= self.total {
