@@ -9,6 +9,10 @@ pub mod call_tree;
 pub mod mem_access;
 pub mod reg_checkpoint;
 pub mod strings;
+pub mod parallel_types;
+pub mod chunk_scan;
+pub mod merge;
+pub mod parallel;
 
 use memchr::memchr;
 use rustc_hash::FxHashMap;
