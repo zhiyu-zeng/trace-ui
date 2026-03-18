@@ -246,66 +246,89 @@ async fn build_index_inner(
     Ok(())
 }
 
-/// Build MemAccessIndex by scanning the mmap data for memory operations.
-/// This is a lightweight pass — only extracts mem_op, no dependency analysis.
+/// Build MemAccessIndex by scanning the mmap data for memory operations (parallel).
+/// Uses rayon to split the file into chunks, build per-chunk indices, then merge.
 fn build_mem_access_index_from_data(
     data: &[u8],
     format: TraceFormat,
 ) -> MemAccessIndex {
     use memchr::memchr;
+    use rayon::prelude::*;
     use crate::taint::{parser, gumtrace_parser};
+    use crate::taint::parallel::split_into_chunks;
     use crate::phase2;
 
-    let mut mem_idx = MemAccessIndex::new();
-    let mut pos = 0usize;
-    let mut seq = 0u32;
-    let len = data.len();
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let chunks = split_into_chunks(data, num_cpus);
 
-    while pos < len {
-        let line_end = match memchr(b'\n', &data[pos..]) {
-            Some(p) => pos + p,
-            None => len,
-        };
-        let end = if line_end > pos && data[line_end - 1] == b'\r' {
-            line_end - 1
-        } else {
-            line_end
-        };
+    // Phase 1: parallel — each chunk builds its own MemAccessIndex
+    let chunk_indices: Vec<MemAccessIndex> = chunks
+        .par_iter()
+        .map(|meta| {
+            let mut mem_idx = MemAccessIndex::new();
+            let mut pos = meta.start_byte;
+            let end_byte = meta.end_byte;
+            let mut seq = meta.start_line;
 
-        if let Ok(raw_line) = std::str::from_utf8(&data[pos..end]) {
-            // Skip gumtrace special lines (they don't have memory operations)
-            if format == TraceFormat::Gumtrace && gumtrace_parser::is_special_line(raw_line) {
-                seq += 1;
-                pos = if line_end < len { line_end + 1 } else { len };
-                continue;
-            }
+            while pos < end_byte {
+                let search_end = end_byte.min(data.len());
+                let line_end = match memchr(b'\n', &data[pos..search_end]) {
+                    Some(p) => pos + p,
+                    None => search_end,
+                };
+                let end = if line_end > pos && data[line_end - 1] == b'\r' {
+                    line_end - 1
+                } else {
+                    line_end
+                };
 
-            let parsed = match format {
-                TraceFormat::Unidbg => parser::parse_line(raw_line),
-                TraceFormat::Gumtrace => gumtrace_parser::parse_line_gumtrace(raw_line),
-            };
+                if let Ok(raw_line) = std::str::from_utf8(&data[pos..end]) {
+                    if format == TraceFormat::Gumtrace && gumtrace_parser::is_special_line(raw_line) {
+                        seq += 1;
+                        pos = if line_end < search_end { line_end + 1 } else { search_end };
+                        continue;
+                    }
 
-            if let Some(line) = parsed {
-                if let Some(ref mem_op) = line.mem_op {
-                    let rw = if mem_op.is_write { MemRw::Write } else { MemRw::Read };
-                    let insn_addr = phase2::extract_insn_addr(raw_line);
-                    mem_idx.add(
-                        mem_op.abs,
-                        MemAccessRecord {
-                            seq,
-                            insn_addr,
-                            rw,
-                            data: mem_op.value.unwrap_or(0),
-                            size: mem_op.elem_width,
-                        },
-                    );
+                    let parsed = match format {
+                        TraceFormat::Unidbg => parser::parse_line(raw_line),
+                        TraceFormat::Gumtrace => gumtrace_parser::parse_line_gumtrace(raw_line),
+                    };
+
+                    if let Some(line) = parsed {
+                        if let Some(ref mem_op) = line.mem_op {
+                            let rw = if mem_op.is_write { MemRw::Write } else { MemRw::Read };
+                            let insn_addr = phase2::extract_insn_addr(raw_line);
+                            mem_idx.add(
+                                mem_op.abs,
+                                MemAccessRecord {
+                                    seq,
+                                    insn_addr,
+                                    rw,
+                                    data: mem_op.value.unwrap_or(0),
+                                    size: mem_op.elem_width,
+                                },
+                            );
+                        }
+                    }
                 }
-            }
-        }
 
-        seq += 1;
-        pos = if line_end < len { line_end + 1 } else { len };
+                seq += 1;
+                pos = if line_end < search_end { line_end + 1 } else { search_end };
+            }
+
+            mem_idx
+        })
+        .collect();
+
+    // Phase 2: sequential merge — records in chunk order = correct seq order
+    let mut merged = MemAccessIndex::new();
+    for idx in chunk_indices {
+        for (addr, record) in idx.iter_all() {
+            merged.add(addr, record.clone());
+        }
     }
 
-    mem_idx
+    merged
 }
