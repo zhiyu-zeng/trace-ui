@@ -350,6 +350,8 @@ pub struct ParsedLine {
     pub writeback: bool,
     /// SIMD lane 索引（如 `{v0.s}[1]` 中的 1）。
     pub lane_index: Option<u8>,
+    /// SIMD lane 元素宽度（字节），从排列标识符推断：s=4, d=8, h=2, b=1。
+    pub lane_elem_width: Option<u8>,
     /// `=>` 箭头左侧的寄存器值对（仅 validate 模式填充）。
     pub pre_arrow_regs: Option<Box<SmallVec<[(RegId, u64); 4]>>>,
     /// `=>` 箭头右侧的寄存器值对（仅 validate 模式填充）。

@@ -326,9 +326,10 @@ pub(crate) fn parse_operands_into(text: &str, out: &mut ParsedLine) -> Option<u8
         }
 
         // Extract lane index if present (e.g., "v0.s[1]" → "v0.s", Some(1))
-        let (token, extracted_lane) = extract_lane_index(token);
+        let (token, extracted_lane, extracted_elem_width) = extract_lane_index(token);
         if extracted_lane.is_some() {
             out.lane_index = extracted_lane;
+            out.lane_elem_width = extracted_elem_width;
         }
 
         // Register operand
@@ -393,23 +394,30 @@ fn try_parse_reg_operand(token: &str) -> Option<RegId> {
     parse_reg(clean)
 }
 
-/// Extract lane index from token like "v0.s[1]".
-/// Returns (token without lane bracket, optional lane index).
-fn extract_lane_index(token: &str) -> (&str, Option<u8>) {
-    // Only look for lane index if there's an arrangement specifier (contains '.')
+/// Extract lane index and element width from token like "v0.s[1]".
+/// Returns (token without lane bracket, optional lane index, optional elem width in bytes).
+fn extract_lane_index(token: &str) -> (&str, Option<u8>, Option<u8>) {
     if let Some(dot_pos) = token.find('.') {
-        // Look for [N] after the dot
         if let Some(bracket_start) = token[dot_pos..].find('[') {
             let abs_bracket = dot_pos + bracket_start;
             if let Some(bracket_end) = token[abs_bracket..].find(']') {
                 let idx_str = &token[abs_bracket + 1..abs_bracket + bracket_end];
                 if let Ok(idx) = idx_str.parse::<u8>() {
-                    return (&token[..abs_bracket], Some(idx));
+                    // Extract element width from arrangement specifier between '.' and '['
+                    let arrangement = &token[dot_pos + 1..abs_bracket];
+                    let elem_width = match arrangement.as_bytes().first() {
+                        Some(b'b') => Some(1u8),
+                        Some(b'h') => Some(2u8),
+                        Some(b's') => Some(4u8),
+                        Some(b'd') | Some(b'D') => Some(8u8),
+                        _ => None,
+                    };
+                    return (&token[..abs_bracket], Some(idx), elem_width);
                 }
             }
         }
     }
-    (token, None)
+    (token, None, None)
 }
 
 /// Parse an immediate value from a string.
@@ -809,23 +817,26 @@ mod tests {
 
     #[test]
     fn test_extract_lane_index_with_lane() {
-        let (rest, lane) = extract_lane_index("v0.s[1]");
+        let (rest, lane, elem_width) = extract_lane_index("v0.s[1]");
         assert_eq!(rest, "v0.s");
         assert_eq!(lane, Some(1));
+        assert_eq!(elem_width, Some(4));
     }
 
     #[test]
     fn test_extract_lane_index_without_lane() {
-        let (rest, lane) = extract_lane_index("v0.16b");
+        let (rest, lane, elem_width) = extract_lane_index("v0.16b");
         assert_eq!(rest, "v0.16b");
         assert_eq!(lane, None);
+        assert_eq!(elem_width, None);
     }
 
     #[test]
     fn test_extract_lane_index_no_dot() {
-        let (rest, lane) = extract_lane_index("x15");
+        let (rest, lane, elem_width) = extract_lane_index("x15");
         assert_eq!(rest, "x15");
         assert_eq!(lane, None);
+        assert_eq!(elem_width, None);
     }
 
     #[test]
