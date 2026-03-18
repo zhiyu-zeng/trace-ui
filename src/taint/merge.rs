@@ -9,7 +9,7 @@ use crate::taint::parallel_types::{
     PartialUnresolvedLoad, PartialUnresolvedPairLoad, UnresolvedLoad, UnresolvedPairLoad,
     UnresolvedRegUse,
 };
-use crate::taint::scanner::{push_unique, PairSplitDeps, RegLastDef, CONTROL_DEP_BIT};
+use crate::taint::scanner::{push_unique, CompactDeps, PairSplitDeps, RegLastDef, CONTROL_DEP_BIT};
 
 /// Resolve a fully unresolved load using global state.
 /// Determines pass-through exactly as single-threaded scan would.
@@ -210,6 +210,50 @@ pub fn resolve_control_deps(
     patches
 }
 
+/// Rebuild a single CompactDeps from multiple chunk deps + patch edges.
+/// patch_edges are (source_line, dep_line) tuples from the fixup phase.
+/// Uses push_unique for deduplication within each row.
+pub fn rebuild_compact_deps(
+    chunk_deps: &[CompactDeps],
+    chunk_start_lines: &[u32],
+    patch_edges: &[(u32, u32)],
+) -> CompactDeps {
+    // Group patch_edges by source line for efficient lookup
+    let mut patches: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for &(from, to) in patch_edges {
+        patches.entry(from).or_default().push(to);
+    }
+
+    // Calculate total capacity
+    let total_lines: usize = chunk_deps.iter().map(|c| c.offsets.len()).sum();
+    let total_deps: usize =
+        chunk_deps.iter().map(|c| c.data.len()).sum::<usize>() + patch_edges.len();
+
+    let mut merged = CompactDeps::with_capacity(total_lines, total_deps);
+
+    for (chunk_id, chunk) in chunk_deps.iter().enumerate() {
+        let num_rows = chunk.offsets.len();
+        for local_row in 0..num_rows {
+            let global_line = chunk_start_lines[chunk_id] + local_row as u32;
+            merged.start_row();
+
+            // Add original deps from this chunk
+            for &dep in chunk.row(local_row) {
+                merged.push_unique(dep);
+            }
+
+            // Add patch deps from fixup
+            if let Some(extras) = patches.get(&global_line) {
+                for &dep in extras {
+                    merged.push_unique(dep);
+                }
+            }
+        }
+    }
+
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,5 +439,54 @@ mod tests {
         assert!(!patches.iter().any(|&(line, _)| line == 103)); // pair/unparsed
         assert!(patches.contains(&(104, 95 | CONTROL_DEP_BIT)));
         assert!(!patches.iter().any(|&(line, _)| line >= 105)); // after first local cond
+    }
+
+    #[test]
+    fn test_rebuild_compact_deps() {
+        // Chunk 0: 3 lines (lines 0,1,2)
+        let mut c0 = CompactDeps::with_capacity(3, 6);
+        c0.start_row(); // line 0: no deps
+        c0.start_row();
+        c0.push_unique(0); // line 1 → line 0
+        c0.start_row();
+        c0.push_unique(1); // line 2 → line 1
+
+        // Chunk 1: 2 lines (lines 3,4)
+        let mut c1 = CompactDeps::with_capacity(2, 4);
+        c1.start_row(); // line 3: no local deps
+        c1.start_row();
+        c1.push_unique(3); // line 4 → line 3
+
+        let patch_edges = vec![
+            (3u32, 2u32), // line 3 depends on line 2 (cross-chunk)
+        ];
+
+        let merged = rebuild_compact_deps(&[c0, c1], &[0, 3], &patch_edges);
+
+        // Verify
+        assert_eq!(merged.row(0).len(), 0); // line 0: no deps
+        assert_eq!(merged.row(1), &[0]); // line 1 → 0
+        assert_eq!(merged.row(2), &[1]); // line 2 → 1
+
+        let mut line3: Vec<u32> = merged.row(3).to_vec();
+        line3.sort();
+        assert_eq!(line3, vec![2]); // line 3 → 2 (from patch)
+
+        assert_eq!(merged.row(4), &[3]); // line 4 → 3
+    }
+
+    #[test]
+    fn test_rebuild_compact_deps_dedup() {
+        let mut c0 = CompactDeps::with_capacity(2, 4);
+        c0.start_row(); // line 0
+        c0.start_row();
+        c0.push_unique(0); // line 1 → 0
+
+        // Patch also adds line 1 → 0 (duplicate)
+        let patch_edges = vec![(1u32, 0u32)];
+
+        let merged = rebuild_compact_deps(&[c0], &[0], &patch_edges);
+        assert_eq!(merged.row(1).len(), 1); // deduped to single entry
+        assert_eq!(merged.row(1), &[0]);
     }
 }
