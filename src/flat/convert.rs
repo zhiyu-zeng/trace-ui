@@ -79,8 +79,11 @@ pub fn deps_to_flat(deps: &DepsStorage) -> FlatDeps {
     match deps {
         DepsStorage::Single(cd) => {
             // Single chunk: trivial — chunk starts at line 0, offsets_start=0, data_start=0
-            let all_offsets = cd.offsets_slice().to_vec();
+            // CompactDeps has N offsets for N rows; DepsView needs N+1 (CSR with sentinel).
+            let mut all_offsets = cd.offsets_slice().to_vec();
             let all_data = cd.data_slice().to_vec();
+            // Add sentinel pointing past the last element
+            all_offsets.push(all_data.len() as u32);
             FlatDeps {
                 chunk_start_lines: vec![0u32],
                 chunk_offsets_start: vec![0u32],
@@ -103,6 +106,8 @@ pub fn deps_to_flat(deps: &DepsStorage) -> FlatDeps {
                 chunk_offsets_start.push(all_offsets.len() as u32);
                 chunk_data_start.push(all_data.len() as u32);
                 all_offsets.extend_from_slice(chunk.offsets_slice());
+                // Add sentinel pointing past the last element (relative to chunk data start)
+                all_offsets.push(chunk.data_slice().len() as u32);
                 all_data.extend_from_slice(chunk.data_slice());
             }
 

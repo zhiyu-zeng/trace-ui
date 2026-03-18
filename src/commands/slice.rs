@@ -21,7 +21,8 @@ pub struct SliceResult {
 /// 解析 from_spec 字符串并找到 BFS 起点行号
 fn resolve_start_index(
     spec: &str,
-    scan_state: &crate::taint::scanner::ScanState,
+    reg_last_def: &crate::taint::scanner::RegLastDef,
+    mem_last_def: &crate::flat::mem_last_def::MemLastDefView,
     mmap: &[u8],
     line_index: &crate::line_index::LineIndex,
     format: TraceFormat,
@@ -33,7 +34,7 @@ fn resolve_start_index(
             .ok_or_else(|| format!("未知寄存器: {}", name))?;
 
         if suffix == "last" {
-            scan_state.reg_last_def.get(&reg)
+            reg_last_def.get(&reg)
                 .copied()
                 .ok_or_else(|| format!("寄存器 {} 在 trace 中从未被定义", name))
         } else {
@@ -53,7 +54,7 @@ fn resolve_start_index(
             .map_err(|_| format!("无效十六进制地址: {}", addr_str))?;
 
         if suffix == "last" {
-            scan_state.mem_last_def.get(&addr)
+            mem_last_def.get(&addr)
                 .map(|(line, _)| line)
                 .ok_or_else(|| format!("地址 0x{:x} 在 trace 中从未被写入", addr))
         } else {
@@ -140,20 +141,24 @@ fn run_slice_inner(
         let sessions = state.sessions.read().map_err(|e| e.to_string())?;
         let session = sessions.get(session_id)
             .ok_or_else(|| format!("Session {} 不存在", session_id))?;
-        let scan_state = session.scan_state.as_ref()
+        let reg_last_def = session.reg_last_def.as_ref()
+            .ok_or("索引尚未构建完成，请等待构建完成后再执行切片")?;
+        let mem_last_def = session.mem_last_def_view()
+            .ok_or("索引尚未构建完成，请等待构建完成后再执行切片")?;
+        let scan_view = session.scan_view()
             .ok_or("索引尚未构建完成，请等待构建完成后再执行切片")?;
 
         let format = session.trace_format;
         let mut start_indices = Vec::new();
         for spec in from_specs {
-            let idx = resolve_start_index(spec, scan_state, &session.mmap, session.line_index.as_ref().ok_or_else(|| "索引尚未构建完成".to_string())?, format)?;
+            let idx = resolve_start_index(spec, reg_last_def, &mem_last_def, &session.mmap, session.line_index.as_ref().ok_or_else(|| "索引尚未构建完成".to_string())?, format)?;
             start_indices.push(idx);
         }
 
         let mut marked = if data_only {
-            slicer::bfs_slice_with_options(scan_state, &start_indices, true)
+            slicer::bfs_slice_with_options(&scan_view, &start_indices, true)
         } else {
-            slicer::bfs_slice(scan_state, &start_indices)
+            slicer::bfs_slice(&scan_view, &start_indices)
         };
 
         // Apply optional range filter
@@ -203,7 +208,7 @@ pub async fn run_slice(
         run_slice_inner(&session_id, &from_specs, start_seq, end_seq, data_only, &state)
     })
     .await
-    .map_err(|e| format!("任务执行失败: {}", e))?
+    .map_err(|e| format!("Task execution failed: {}", e))?
 }
 
 #[tauri::command]
