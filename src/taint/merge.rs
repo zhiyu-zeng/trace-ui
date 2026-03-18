@@ -609,6 +609,20 @@ pub fn merge_all_chunks(
         }
     }
 
+    // === Compact global_mem_last_def immediately after Pass 1 ===
+    // HashMap 存储 200M+ 条目可达 10-16GB（桶数组 + entries）。
+    // 立即转为 sorted Vec（~4GB）释放 HashMap 的巨大开销。
+    // Pass 1 之后不再需要 HashMap 的查询能力。
+    let global_mem_sorted: Vec<(u64, u32, u64)> = {
+        let mut sorted: Vec<(u64, u32, u64)> = global_mem_last_def
+            .drain()
+            .map(|(addr, (line, val))| (addr, line, val))
+            .collect();
+        drop(global_mem_last_def); // 立即释放 HashMap 桶数组
+        sorted.sort_unstable_by_key(|(addr, _, _)| *addr);
+        sorted
+    };
+
     if let Some(ref cb) = progress_fn { cb(0.2); }
 
     // === Pass 2: Decompose chunk_results (move out data) ===
@@ -722,9 +736,8 @@ pub fn merge_all_chunks(
     // pair_split
     let pair_split = merge_pair_splits(chunk_pair_splits, all_pair_fixups);
 
-    // Build ScanState
-    let mut mem_last_def_map = MemLastDef::Map(global_mem_last_def);
-    mem_last_def_map.compact();
+    // Build ScanState — use pre-compacted sorted Vec (already freed HashMap in Pass 1)
+    let mem_last_def_map = MemLastDef::Sorted(global_mem_sorted);
 
     let scan_state = ScanState {
         reg_last_def: global_reg_last_def,
